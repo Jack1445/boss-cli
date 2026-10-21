@@ -1,4 +1,5 @@
 import type { Frame, Page } from 'puppeteer-core';
+import { readFile } from 'node:fs/promises';
 import {
   JOB_SEARCH_ACTION_GAP_MS,
   JOB_SELECT_ACTION_GAP_MS,
@@ -231,11 +232,32 @@ export async function assertRecommendPageReadyForPreview(page: Page): Promise<Fr
   return assertRecommendPageReady(page, '预览候选人');
 }
 
-export async function readRecommendList(frame: Frame): Promise<RecommendCandidate[]> {
+export async function readRecommendList(frame: Frame, limit?: number, excluded: Array<{ name: string; baseInfo: string }> = []): Promise<RecommendCandidate[]> {
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 10)) {
+    throw new Error('推荐试读数量必须是 1 到 10 的整数。');
+  }
   return (await frame.evaluate(`(() => {
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
     const cardSel = ${JSON.stringify(RECOMMEND_CARD_ROOT_SELECTOR)};
-    const cards = Array.from(document.querySelectorAll(cardSel));
+    // A candidate can match both the outer wrapper and a nested card selector.
+    // Canonicalize before applying the cap so 10 means 10 distinct people.
+    const seenNodes = new Set();
+    const key = (name, baseInfo) => JSON.stringify([norm(name), norm(baseInfo)]);
+    const seenPeople = new Set(${JSON.stringify(excluded)}.map(p => key(p.name, p.baseInfo)));
+    const cards = [];
+    for (const item of document.querySelectorAll(cardSel)) {
+      const inner = item.querySelector('.card-inner') || item;
+      if (seenNodes.has(inner)) continue;
+      seenNodes.add(inner);
+      const name = norm(item.querySelector('.name-wrap .name')?.textContent) || norm(item.querySelector('.name')?.textContent);
+      const baseInfo = Array.from(item.querySelectorAll('.base-info span')).map(el => norm(el.textContent)).filter(Boolean).join(' / ');
+      if (!name) continue;
+      const identity = key(name, baseInfo);
+      if (seenPeople.has(identity)) continue;
+      seenPeople.add(identity);
+      cards.push(item);
+      if (cards.length >= ${limit ?? 'Infinity'}) break;
+    }
     return cards.map((item) => {
       const inner = item.querySelector(".card-inner") || item;
       const wrap = item.matches(".candidate-card-wrap")
@@ -493,12 +515,62 @@ export async function openRecommendResumePreview(frame: Frame, target: string): 
   return opened;
 }
 
-export async function runRecommend(jobKeyword?: string): Promise<string> {
+export async function collectNewRecommendations(frame: Frame, limit: number, excluded: Array<{ name: string; baseInfo: string }>): Promise<{ candidates: RecommendCandidate[]; stop_reason: string }> {
+  const collected: RecommendCandidate[] = [];
+  let stale = 0;
+  let previousSignature = '';
+  // Bound each user-triggered search. Never run an open-ended crawl.
+  for (let pass = 0; pass <= 15; pass++) {
+    const next = await readRecommendList(frame, limit - collected.length, [...excluded, ...collected]);
+    collected.push(...next);
+    if (collected.length >= limit) return { candidates: collected, stop_reason: 'limit' };
+    const signature = await frame.evaluate(`(() => {
+      const nodes = Array.from(document.querySelectorAll(${JSON.stringify(RECOMMEND_CARD_ROOT_SELECTOR)}));
+      return JSON.stringify(nodes.map(el => {
+        const inner = el.querySelector('.card-inner') || el;
+        return [inner.getAttribute('data-geekid') || inner.getAttribute('data-geek') || '', el.querySelector('.name')?.textContent || ''];
+      }));
+    })()`) as string;
+    stale = signature === previousSignature ? stale + 1 : 0;
+    previousSignature = signature;
+    if (stale >= 3) return { candidates: collected, stop_reason: 'no_more' };
+    if (pass === 15) break;
+    await frame.evaluate(`(() => {
+      const cards = document.querySelectorAll(${JSON.stringify(RECOMMEND_CARD_ROOT_SELECTOR)});
+      const last = cards[cards.length - 1];
+      if (last) last.scrollIntoView({block: 'end'});
+      let parent = last?.parentElement;
+      while (parent) {
+        const style = getComputedStyle(parent);
+        if (/(auto|scroll)/.test(style.overflowY) && parent.scrollHeight > parent.clientHeight) {
+          parent.scrollTop = parent.scrollHeight;
+          parent.dispatchEvent(new Event('scroll'));
+          return;
+        }
+        parent = parent.parentElement;
+      }
+      window.scrollTo(0, document.documentElement.scrollHeight);
+    })()`);
+    await sleepRandom(700, 1000);
+  }
+  return { candidates: collected, stop_reason: 'scan_limit' };
+}
+
+export async function runRecommend(jobKeyword?: string, options: { limit?: number; json?: boolean; excludeFile?: string } = {}): Promise<string> {
+  const limit = options.limit ?? 10;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 10) throw new Error('推荐试读数量必须是 1 到 10 的整数。');
+  let excluded: Array<{ name: string; baseInfo: string }> = [];
+  if (options.excludeFile) {
+    const input: unknown = JSON.parse(await readFile(options.excludeFile, 'utf8'));
+    if (!Array.isArray(input) || input.some(p => !p || typeof p.name !== 'string' || typeof p.baseInfo !== 'string')) throw new Error('查重文件必须包含姓名与基本信息两个字段');
+    excluded = input;
+  }
   try {
     return await withBossSessionPage(async (page) => {
       const frame = await ensureInRecommendPage(page);
       const selectedJob = await selectRecommendJob(frame, (jobKeyword ?? '').trim());
-      const candidates = await readRecommendList(frame);
+      const { candidates, stop_reason } = options.excludeFile ? await collectNewRecommendations(frame, limit, excluded) : { candidates: await readRecommendList(frame, limit), stop_reason: 'loaded' };
+      if (options.json) return JSON.stringify({ version: 1, job_label: selectedJob, limit, candidates, stop_reason, captured_at: new Date().toISOString() });
       const title = selectedJob ? `当前岗位：${selectedJob}` : '当前岗位：默认';
       return [title, '', renderRecommendList(candidates)].join('\n');
     });

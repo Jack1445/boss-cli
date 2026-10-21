@@ -25,6 +25,8 @@ import {
   type ChatPageAction,
 } from '../toolset/index.js';
 import { printBossInteractiveBanner } from './banner.js';
+import { runClassifyCommunications } from '../toolset/communication.js';
+import { runRecommendResume } from '../toolset/recommend-resume.js';
 import {
   printPackageUpdateNoticeIfDue,
   printVersionInfo,
@@ -164,8 +166,12 @@ function printHelp(): void {
       读取当前职位列表（含开放/待开放/已关闭状态）
   boss jd <name>
       抓取指定职位详情并缓存到项目目录同名 .md
-  boss recommend [岗位关键字]
-      进入推荐页并读取推荐列表；带岗位关键字时先在岗位下拉中模糊匹配并切换
+  boss recommend [岗位关键字] [--limit 10] [--json] [--exclude-file <查重JSON文件>]
+      最多 10 人；--exclude-file 按姓名与基本信息跳过旧人，限量滚动找新人；不打招呼；--json 输出结构化快照
+  boss classify --targets <JSON数组>
+      手动核验最多 10 个已加载会话的双方消息与求简历状态；会打开会话，可能标记已读，不发送消息
+  boss recommend-resume --geek-id <ID> --name <姓名> --output <绝对PNG路径>
+      进入推荐页，按 ID 和姓名核对后仅截图这一人的在线简历；不执行 OCR、不打招呼
   boss search [关键词]
       进入「搜索」页并读取 Boss 默认常规搜索结果；带关键词时填入搜索框并回车搜索
   boss preview <姓名>
@@ -539,16 +545,34 @@ export async function executeCommand(argv: string[]): Promise<string> {
     return implPreview({ candidateTarget });
   }
 
+  if (cmd === 'recommend-resume') {
+    const { rest, opts, flags } = parseOpts(tail);
+    if (rest.length || flags.size || Object.keys(opts).some(key => !['geek-id', 'name', 'output'].includes(key)) || !opts['geek-id'] || !opts.name || !opts.output) {
+      die('❌ 用法: recommend-resume --geek-id <ID> --name <姓名> --output <绝对PNG路径>');
+    }
+    return runRecommendResume({ geekId: opts['geek-id'], name: opts.name, output: opts.output });
+  }
+
   if (cmd === 'recommend') {
     const { rest, opts, flags } = parseOpts(tail);
     if (rest[0] === 'preview') {
       die('❌ 请改用: boss preview <姓名>（已不再使用 recommend preview）');
     }
-    if (Object.keys(opts).length > 0 || flags.size > 0) {
-      die('❌ 用法: recommend [岗位关键字]');
+    if (Object.keys(opts).some((key) => !['limit', 'exclude-file'].includes(key)) || [...flags].some((flag) => flag !== 'json')) {
+      die('❌ 用法: recommend [岗位关键字] [--limit 10] [--json] [--exclude-file <查重JSON文件>]');
     }
     const jobKeyword = rest.join(' ').trim();
-    return implRecommend(jobKeyword || undefined);
+    const limit = opts.limit === undefined ? 10 : Number(opts.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 10) die('❌ limit 必须是 1 到 10 的整数');
+    return implRecommend(jobKeyword || undefined, { limit, json: flags.has('json'), excludeFile: opts['exclude-file'] });
+  }
+
+  if (cmd === 'classify') {
+    const { rest, opts, flags } = parseOpts(tail);
+    if (rest.length || flags.size || Object.keys(opts).some((key) => key !== 'targets') || !opts.targets) {
+      die('❌ 用法: classify --targets <JSON数组>，最多 10 个候选人');
+    }
+    return runClassifyCommunications(JSON.parse(opts.targets));
   }
 
   if (cmd === 'greet') {
