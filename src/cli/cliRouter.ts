@@ -5,6 +5,7 @@
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { detachBrowserSession } from '../browser/index.js';
+import { bossTimed } from '../common/debug.js';
 import {
   implChatAction,
   implLogin,
@@ -653,7 +654,7 @@ export async function runCli(argv: string[]): Promise<void> {
   }
 
   if (normalizeSubcommand(argv[0] ?? '') !== 'update') {
-    await printPackageUpdateNoticeIfDue();
+    await bossTimed('cli.update_check', () => printPackageUpdateNoticeIfDue());
   }
 
   if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
@@ -662,8 +663,8 @@ export async function runCli(argv: string[]): Promise<void> {
   }
 
   try {
-    await runOneCommand(argv);
+    await bossTimed('cli.command', () => runOneCommand(argv));
   } finally {
-    await cleanupAfterCommand(argv[0] ?? '', true);
+    await bossTimed('cli.cleanup', () => cleanupAfterCommand(argv[0] ?? '', true));
   }
 }

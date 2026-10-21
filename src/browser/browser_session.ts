@@ -1,7 +1,7 @@
-import type { ChildProcess } from 'node:child_process';
 import type { Browser, Page } from 'puppeteer-core';
 import { clearSpawnedChromeProcessRef, connectBrowser } from './cdp_browser.js';
 import { installBossBrowserPageGuards, installBossPageGuards } from '../common/boss_page_guards.js';
+import { bossTimed } from '../common/debug.js';
 let browserRef: Browser | null = null;
 let pageRef: Page | null = null;
 let connectPromise: Promise<void> | null = null;
@@ -110,13 +110,13 @@ async function establishSession(): Promise<void> {
     pageRef = null;
   }
 
-  const b = await connectBrowser();
+  const b = await bossTimed('browser.connect', () => connectBrowser());
   browserRef = b;
   attachDisconnectedHandler(b);
-  await installBossBrowserPageGuards(b);
-  pageRef = await pickOrCreatePage(b);
-  await installBossPageGuards(pageRef);
-  await closeRedundantBlankPages(b, pageRef);
+  await bossTimed('browser.install_guards', () => installBossBrowserPageGuards(b));
+  pageRef = await bossTimed('browser.select_page', () => pickOrCreatePage(b));
+  await bossTimed('browser.install_page_guards', () => installBossPageGuards(pageRef!));
+  await bossTimed('browser.close_blank_pages', () => closeRedundantBlankPages(b, pageRef));
 }
 
 /**
@@ -210,32 +210,21 @@ export async function disconnectBrowserSession(): Promise<void> {
   clearSpawnedChromeProcessRef();
 }
 
-function unrefBrowserChildProcess(proc: ChildProcess | null | undefined): void {
-  if (!proc) return;
-  try {
-    proc.unref();
-  } catch {
-    /* ignore */
-  }
-}
-
 /**
  * 仅断开与浏览器的 CDP 连接，但不主动关闭浏览器进程。
  * 用于 `boss login` 这类“需要用户继续在浏览器里操作”的场景：
  * CLI 可以立刻退出，而浏览器窗口仍保留给用户完成登录。
  *
- * 必须在 disconnect 后对 Chrome 子进程 `unref`，否则 Node 会因子进程仍存活而无法退出。
+ * disconnect 后释放自行 spawn 的 Chrome 子进程句柄和日志管道。
+ * connect 模式的 browser.process() 为 null，不能用它释放实际的子进程。
  *
  * 注意：**绝不调用 `browser.close()`**——历史上在 disconnect 抛错时误走 close 会导致退出 CLI 时浏览器被关掉。
  */
 export async function detachBrowserSession(): Promise<void> {
   const b = browserRef;
-  if (!b) return;
-  let proc: ChildProcess | null | undefined;
-  try {
-    proc = typeof b.process === 'function' ? b.process() : undefined;
-  } catch {
-    proc = undefined;
+  if (!b) {
+    clearSpawnedChromeProcessRef();
+    return;
   }
   try {
     b.removeAllListeners('disconnected');
@@ -247,7 +236,6 @@ export async function detachBrowserSession(): Promise<void> {
   } catch {
     /* 仍不 close；仅断开失败时依赖下方 unref 与进程退出行为 */
   }
-  unrefBrowserChildProcess(proc ?? null);
   clearSpawnedChromeProcessRef();
   browserRef = null;
   pageRef = null;

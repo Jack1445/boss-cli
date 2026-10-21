@@ -8,6 +8,7 @@ import {
 import { BOSS_CHAT_INDEX_URL, isBossChatIndexUrl } from '../common/auth.js';
 import { ensurePage } from '../common/ensure_page.js';
 import { withBossSessionPage } from '../common/boss_session_page.js';
+import { bossTimed } from '../common/debug.js';
 
 type CandidateItem = {
   name: string;
@@ -92,13 +93,13 @@ export async function ensureChatListReady(
   page: Page,
   filter: 'all' | 'unread' = 'all',
 ): Promise<void> {
-  await ensurePage(page, {
+  await bossTimed('candidates.navigate', () => ensurePage(page, {
     name: '沟通列表页',
     targetUrl: BOSS_CHAT_INDEX_URL,
     matches: isBossChatIndexUrl,
-  });
+  }));
 
-  await page.waitForFunction(
+  await bossTimed('candidates.filter_ready', () => page.waitForFunction(
     `(() => {
       const filter = document.querySelector(".chat-message-filter-left");
       if (!filter) return false;
@@ -106,18 +107,18 @@ export async function ensureChatListReady(
       return tabs.length >= 2;
     })()`,
     { timeout: 15_000 },
-  );
+  ));
 
   const filterLabel = filter === 'unread' ? '未读' : '全部';
-  await clickChatFilterTab(page, filterLabel);
-  await sleepRandom(LIST_FILTER_GAP_MS.min, LIST_FILTER_GAP_MS.max);
-  await waitForChatFilterTabSelected(page, filterLabel);
-  await waitForCandidateListSettled(page, {
+  await bossTimed('candidates.filter_click', () => clickChatFilterTab(page, filterLabel));
+  await bossTimed('candidates.filter_delay', () => sleepRandom(LIST_FILTER_GAP_MS.min, LIST_FILTER_GAP_MS.max));
+  await bossTimed('candidates.filter_selected', () => waitForChatFilterTabSelected(page, filterLabel));
+  await bossTimed('candidates.list_settled', () => waitForCandidateListSettled(page, {
     timeoutMs: 18_000,
     pollMsMin: LIST_POLL_MS.min,
     pollMsMax: LIST_POLL_MS.max,
     minMsBeforeEmptyOk: LIST_MIN_BEFORE_EMPTY_OK_MS,
-  });
+  }));
 }
 
 export async function runGetCandidateList(
@@ -129,7 +130,7 @@ export async function runGetCandidateList(
     return await withBossSessionPage(async (page) => {
       await ensureChatListReady(page, unreadOnly ? 'unread' : 'all');
 
-      const items = (await page.evaluate(
+      const items = (await bossTimed('candidates.extract', () => page.evaluate(
         `(() => {
           const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
           return Array.from(document.querySelectorAll(".geek-item")).map((el) => {
@@ -146,7 +147,7 @@ export async function runGetCandidateList(
             return { name, job, time, message, unreadCount };
           });
         })()`,
-      )) as CandidateItem[];
+      ))) as CandidateItem[];
 
       const candidates = items.filter((it) => it.name) as CandidateItem[];
       const withUnread = candidates.filter((it) => it.unreadCount > 0).length;

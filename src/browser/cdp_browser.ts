@@ -4,6 +4,7 @@ import readline from 'node:readline';
 import path from 'node:path';
 import puppeteer, { type Browser, type CDPSession, type Page } from 'puppeteer-core';
 import { BROWSER_USER_DATA_DIR, ensureAppDataLayout } from '../config.js';
+import { bossDebug } from '../common/debug.js';
 
 /** 与 @puppeteer/browsers 一致，解析 Chrome 启动日志中的 CDP WebSocket URL（可能在 stdout 或 stderr）。 */
 const CDP_WEBSOCKET_ENDPOINT_REGEX = /^DevTools listening on (ws:\/\/.*)$/;
@@ -29,7 +30,18 @@ let spawnedChromeChild: ChildProcess | null = null;
 let lastChromeLaunchHeadless = false;
 
 export function clearSpawnedChromeProcessRef(): void {
+  // connect() does not attach this ChildProcess to Puppeteer's browser.process().
+  // Releasing only the process reference/unref leaves stdout/stderr pipes alive
+  // in Node's event loop, so a finished CLI cannot exit until Chrome closes.
+  // Close our read ends; do not terminate the independently running browser.
+  const proc = spawnedChromeChild;
   spawnedChromeChild = null;
+  if (proc) {
+    proc.stdout?.destroy();
+    proc.stderr?.destroy();
+    proc.unref();
+    bossDebug('browser-child-handles-released', { pid: proc.pid });
+  }
 }
 
 /** 最近一次启动是否为无头（仅本进程内、与当前会话一致时有效）。 */
@@ -262,6 +274,7 @@ export async function connectBrowser(options: ConnectBrowserOptions = {}): Promi
 
   const profileDirectory =
     options.profileDirectory?.trim() || process.env.BOSS_BROWSER_PROFILE_DIRECTORY?.trim();
+  const headless = options.headless ?? process.env.BOSS_BROWSER_HEADLESS === 'true';
 
   if (!executablePath) {
     throw new Error(
@@ -269,7 +282,14 @@ export async function connectBrowser(options: ConnectBrowserOptions = {}): Promi
     );
   }
 
-  const headless = options.headless ?? process.env.BOSS_BROWSER_HEADLESS === 'true';
+  bossDebug('browser-connect-start', {
+    executablePath,
+    userDataDir,
+    profileDirectory: profileDirectory ?? '',
+    remoteDebuggingPort: REMOTE_DEBUGGING_PORT,
+    headless,
+  });
+
   const allowAllCors = options.allowAllCors ?? process.env.BOSS_BROWSER_ALLOW_ALL_CORS === 'true';
   const disableGpu = process.env.BOSS_BROWSER_DISABLE_GPU === 'true';
 
@@ -282,6 +302,7 @@ export async function connectBrowser(options: ConnectBrowserOptions = {}): Promi
    */
   const existingWsUrl = await probeRemoteDebuggingWsEndpoint(REMOTE_DEBUGGING_PORT, 800);
   if (existingWsUrl) {
+    bossDebug('browser-cdp-reuse', { remoteDebuggingPort: REMOTE_DEBUGGING_PORT });
     return await puppeteer.connect({
       browserWSEndpoint: existingWsUrl,
       defaultViewport: launchViewportFromEnv(),
@@ -324,10 +345,12 @@ export async function connectBrowser(options: ConnectBrowserOptions = {}): Promi
   });
 
   spawnedChromeChild = proc;
+  bossDebug('browser-spawned', { pid: proc.pid, remoteDebuggingPort: REMOTE_DEBUGGING_PORT });
 
   let wsUrl: string;
   try {
     wsUrl = await waitForDevToolsWebSocketUrl(proc, userDataDir, LAUNCH_READY_MS);
+    bossDebug('browser-cdp-ready', { remoteDebuggingPort: REMOTE_DEBUGGING_PORT });
   } catch (e) {
     try {
       proc.kill();

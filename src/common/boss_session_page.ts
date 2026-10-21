@@ -14,6 +14,7 @@ import { CONTEXT_DESTROY_RETRY_MS } from '../browser/human_delay.js';
 import { sleepRandom } from '../browser/timing.js';
 import { installBossPageGuards } from './boss_page_guards.js';
 import { withBossSessionLock } from './boss_session_lock.js';
+import { bossDebug, bossTimed } from './debug.js';
 
 const SHOULD_DISABLE_JS =
   process.env.BOSS_BROWSER_DISABLE_JS === 'true' || process.env.BOSS_BROWSER_DISABLE_JS === '1';
@@ -87,10 +88,13 @@ async function readMenuListSnapshot(page: Page): Promise<MenuListSnapshot> {
  * 避免触发"先回到聊天页再切回业务页"的额外跳转。
  */
 async function ensureBossChatShellUrlBeforeMenuList(page: Page): Promise<void> {
+  bossDebug('shell-url-check', { currentUrl: page.url() });
   if (isBossChatShellUrl(page.url())) {
     return;
   }
+  bossDebug('shell-navigation-start', { targetUrl: BOSS_CHAT_INDEX_URL });
   await page.goto(BOSS_CHAT_INDEX_URL, { waitUntil: 'load', timeout: 60_000 });
+  bossDebug('shell-navigation-complete', { currentUrl: page.url() });
 }
 
 async function ensureMenuListMountedAfterLoad(page: Page): Promise<void> {
@@ -117,6 +121,11 @@ async function ensureMenuListMountedAfterLoad(page: Page): Promise<void> {
   }
 
   const first = await readMenuListSnapshot(page);
+  bossDebug('menu-list-snapshot', {
+    currentUrl: page.url(),
+    exists: first.exists,
+    signature: first.signature.slice(0, 500),
+  });
   if (!first.exists) {
     throw new Error('当前页面可能未登录或未进入 Boss 主界面。');
   }
@@ -151,7 +160,7 @@ export async function withBossSessionPage<T>(
     let lastErr: unknown;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
-      await ensureBrowserSession();
+      await bossTimed('browser.ensure_session', () => ensureBrowserSession());
       const browser = getBrowserRef();
       if (!browser) {
         throw new Error('无法获取浏览器实例。');
@@ -162,18 +171,19 @@ export async function withBossSessionPage<T>(
         page = (await pickExistingPage(browser)) ?? (await browser.newPage());
       }
       setSessionPage(page);
-      await page.bringToFront();
+      bossDebug('session-page-selected', { currentUrl: page.url(), title: await page.title() });
+      await bossTimed('browser.bring_to_front', () => page!.bringToFront());
 
-      await installBossPageGuards(page);
+      await bossTimed('browser.page_guards', () => installBossPageGuards(page!));
 
       if (shouldEnsureChatShell) {
-        await ensureBossChatShellUrlBeforeMenuList(page);
+        await bossTimed('page.chat_shell', () => ensureBossChatShellUrlBeforeMenuList(page!));
       }
       if (SHOULD_DISABLE_JS) {
         await page.setJavaScriptEnabled(false);
       }
       if (shouldEnsureMenuList) {
-        await ensureMenuListMountedAfterLoad(page);
+        await bossTimed('page.sidebar_ready', () => ensureMenuListMountedAfterLoad(page!));
       }
 
       return await callback(page);

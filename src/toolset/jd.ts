@@ -1,8 +1,10 @@
 import { access, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { sleepRandom } from '../browser/index.js';
+import { bossTimed } from '../common/debug.js';
 import { withBossSessionPage } from '../common/boss_session_page.js';
 import { clickBossSidebarMenuToPath } from '../common/boss_sidebar_nav.js';
+import { bossDebug } from '../common/debug.js';
 import { JD_DIR } from '../config.js';
 import type { Frame, Page } from 'puppeteer-core';
 
@@ -75,6 +77,11 @@ type JobReadState = {
   url: string;
   bodyPreview: string;
 };
+
+function hasExplicitEmptyJobList(totalText: string, bodyPreview: string): boolean {
+  const normalized = `${totalText} ${bodyPreview}`.replace(/\s+/g, '');
+  return /(?:共|总计)0(?:个职位|条职位|个岗位|条岗位)/.test(normalized) || /暂无职位|没有职位/.test(normalized);
+}
 
 type JobReadResult = JobReadState & {
   jobs: JobListItem[];
@@ -151,20 +158,44 @@ async function fileExists(target: string): Promise<boolean> {
 
 async function readJobsFromFrame(frame: Frame): Promise<JobReadResult> {
   return (await frame.evaluate(
-    `(() => {
+    `(async () => {
       const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
-      const rows = Array.from(document.querySelectorAll(".job-jobInfo-warp"));
-      const jobs = rows.map((el) => {
+      const rows = Array.from(document.querySelectorAll(".job-item-container"));
+      let apiJobs = [];
+      if (rows.length > 0) {
+        const apiResponse = await fetch("/wapi/zpjob/job/data/list?position=0&type=0&searchStr=&comId=&tagIdStr=&page=1", {
+          credentials: "include",
+        });
+        if (!apiResponse.ok) {
+          throw new Error("读取职位 ID 接口失败：HTTP " + apiResponse.status);
+        }
+        const apiPayload = await apiResponse.json();
+        apiJobs = Array.isArray(apiPayload?.zpData?.data) ? apiPayload.zpData.data : [];
+        if (apiJobs.length < rows.length) {
+          throw new Error("职位 ID 接口返回 " + apiJobs.length + " 条，页面显示 " + rows.length + " 条，无法安全对应岗位。");
+        }
+      }
+      const jobs = rows.map((el, index) => {
         const statusText = norm(el.querySelector(".job-status-wrapper .status-box")?.textContent);
-        const labelText = norm(el.querySelector(".job-title .label-common")?.textContent);
-        const meta = Array.from(el.querySelectorAll(".job-main-info-wrapper .info-labels span"))
+        const labelText = norm(el.querySelector(".job-title .job-labels .base-label")?.textContent);
+        const titleText = norm(el.querySelector(".job-title .job-name")?.textContent);
+        const meta = Array.from(el.querySelectorAll(".job-main-info-wrapper .info-labels .divider-label-text"))
           .map((x) => norm(x.textContent))
           .filter(Boolean);
         const nums = Array.from(el.querySelectorAll(".job-about-num-wrapper .inner-box .num"))
           .map((x) => norm(x.textContent));
+        const apiJob = apiJobs[index] ?? {};
+        const apiTitle = norm(apiJob.jobName || apiJob.positionName);
+        if (apiTitle && apiTitle !== titleText) {
+          throw new Error("职位接口与页面顺序不一致：第 " + (index + 1) + " 条页面为“" + titleText + "”，接口为“" + apiTitle + "”。");
+        }
+        const id = norm(apiJob.encryptId || apiJob.encryptJobId);
+        if (!id) {
+          throw new Error("职位“" + (titleText || ("第 " + (index + 1) + " 条")) + "”缺少稳定 ID。");
+        }
         return {
-          id: norm(el.getAttribute("data-id")),
-          title: norm(el.querySelector(".job-title a")?.textContent),
+          id,
+          title: titleText,
           label: labelText,
           status: statusText,
           meta,
@@ -191,7 +222,7 @@ async function readJobsFromPageAnyFrame(
   page: Page,
 ): Promise<JobListContext> {
   const main = await readJobsFromFrame(page.mainFrame());
-  if (main.rows > 0 || main.totalText.length > 0) {
+  if (main.rows > 0) {
     return {
       frame: page.mainFrame(),
       data: main,
@@ -201,6 +232,7 @@ async function readJobsFromPageAnyFrame(
     };
   }
 
+  let emptyFrame: JobListContext | null = null;
   const frames = page.frames();
   for (const frame of frames) {
     if (frame === page.mainFrame()) {
@@ -208,7 +240,7 @@ async function readJobsFromPageAnyFrame(
     }
     try {
       const state = await readJobsFromFrame(frame);
-      if (state.rows > 0 || state.totalText.length > 0) {
+      if (state.rows > 0) {
         return {
           frame,
           data: state,
@@ -217,9 +249,33 @@ async function readJobsFromPageAnyFrame(
           mainState: main,
         };
       }
-    } catch {
+      if (
+        emptyFrame === null &&
+        hasExplicitEmptyJobList(state.totalText, state.bodyPreview)
+      ) {
+        emptyFrame = {
+          frame,
+          data: state,
+          fromFrame: true,
+          frameUrl: state.url,
+          mainState: main,
+        };
+      }
+    } catch (error) {
+      const frameUrl = frame.url();
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        frameUrl.includes("/web/frame/job_v2/list") &&
+        !/detached|execution context was destroyed|cannot find context/i.test(message)
+      ) {
+        throw error;
+      }
       // ignore cross-origin / detached frames
     }
+  }
+
+  if (emptyFrame) {
+    return emptyFrame;
   }
 
   return {
@@ -236,14 +292,24 @@ async function waitForJobRowsReady(
   timeoutMs: number,
 ): Promise<JobListContext> {
   const start = Date.now();
+  bossDebug('job-rows-wait-start', { currentUrl: page.url(), timeoutMs });
   while (Date.now() - start < timeoutMs) {
     const state = await readJobsFromPageAnyFrame(page);
-    if (state.data.rows > 0 || state.data.totalText.length > 0) {
+    if (
+      state.data.rows > 0 ||
+      hasExplicitEmptyJobList(state.data.totalText, state.data.bodyPreview)
+    ) {
       return state;
     }
     await sleepRandom(260, 520);
   }
   const last = await readJobsFromPageAnyFrame(page);
+  bossDebug('job-rows-timeout', {
+    currentUrl: page.url(),
+    main: last.mainState,
+    frameHit: last.fromFrame,
+    frameUrl: last.frameUrl,
+  });
   throw new Error(
     [
       '等待职位列表超时',
@@ -266,19 +332,20 @@ async function clickEditForJob(frame: Frame, job: JobListItem): Promise<void> {
       const jobId = ${targetId};
       const title = ${targetTitle};
       const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
-      const rows = Array.from(document.querySelectorAll(".job-jobInfo-warp"));
+      const rows = Array.from(document.querySelectorAll(".job-item-container"));
       let row = null;
       if (jobId) {
         row = rows.find((el) => norm(el.getAttribute("data-id")) === jobId) ?? null;
       }
       if (!row && title) {
         row = rows.find((el) => {
-          const t = norm(el.querySelector(".job-title a")?.textContent);
+          const t = norm(el.querySelector(".job-title .job-name")?.textContent);
           return t === title;
         }) ?? null;
       }
       if (!row) return false;
-      const editBtn = row.querySelector(".position-edit");
+      const editBtn = Array.from(row.querySelectorAll(".operation-container .operate-btn"))
+        .find((el) => norm(el.textContent) === "编辑");
       if (!(editBtn instanceof HTMLElement)) return false;
       editBtn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
       editBtn.click();
@@ -433,15 +500,17 @@ export async function runListOpenPositions(
   try {
     return await withBossSessionPage(async (page) => {
       const currentUrl = page.url();
+      bossDebug('positions-start', { currentUrl, detailMode, detailName });
       if (!isBossChatJobListUrl(currentUrl)) {
-        await clickBossSidebarMenuToPath(page, '职位管理', '/web/chat/job/list');
-        await sleepRandom(settleMin, settleMax);
+        await bossTimed('positions.navigate', () => clickBossSidebarMenuToPath(page, '职位管理', '/web/chat/job/list'));
+        await bossTimed('positions.settle_delay', () => sleepRandom(settleMin, settleMax));
       }
+      bossDebug('positions-after-navigation', { currentUrl: page.url() });
       if (!isBossChatJobListUrl(page.url())) {
         throw new Error('通过侧边栏“职位管理”进入职位页失败，请确认已登录并可访问 /web/chat/job/list。');
       }
-      const ready = await waitForJobRowsReady(page, 16_000);
-      await sleepRandom(350, 920);
+      const ready = await bossTimed('positions.rows_ready', () => waitForJobRowsReady(page, 16_000));
+      await bossTimed('positions.after_rows_delay', () => sleepRandom(350, 920));
 
       const jobs = ready.data.jobs.filter((it) => it.title.length > 0);
       const jobLines = jobs.map((it, idx) => {

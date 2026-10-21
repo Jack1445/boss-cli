@@ -3,6 +3,7 @@ import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { sleepRandom } from '../browser/timing.js';
 import { CACHE_DIR, ensureAppDataLayout } from '../config.js';
+import { bossDebug, bossTimingStart } from './debug.js';
 
 const SESSION_LOCK_FILE = join(CACHE_DIR, 'session.lock');
 const SESSION_LOCK_WAIT_MAX_MS = 30_000;
@@ -100,6 +101,9 @@ function formatSessionLockOwner(meta: SessionLockMeta | null): string {
 export async function withBossSessionLock<T>(callback: () => Promise<T>): Promise<T> {
   ensureAppDataLayout();
   const deadline = Date.now() + SESSION_LOCK_WAIT_MAX_MS;
+  bossDebug('session-lock-wait-start', { lockPath: SESSION_LOCK_FILE });
+  const finishLockWait = bossTimingStart('session.lock_wait');
+  let acquired = false;
 
   while (true) {
     try {
@@ -117,19 +121,31 @@ export async function withBossSessionLock<T>(callback: () => Promise<T>): Promis
         throw new Error('Boss session lock creation failed.');
       }
 
+      bossDebug('session-lock-acquired', { pid: process.pid });
+      acquired = true;
+      finishLockWait();
+
       try {
         return await callback();
       } finally {
         await rm(SESSION_LOCK_FILE, { force: true }).catch(() => {});
+        bossDebug('session-lock-released', { pid: process.pid });
       }
     } catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? error.code : '';
-      if (code !== 'EEXIST') {
+      // Windows may report EPERM/EACCES instead of EEXIST when another
+      // process has the lock file open. Treat those codes as contention and
+      // use the same stale-lock cleanup and bounded wait path.
+      if (code !== 'EEXIST' && code !== 'EPERM' && code !== 'EACCES') {
+        if (!acquired) finishLockWait('failed');
         throw error;
       }
 
+      bossDebug('session-lock-contended', { code, pid: process.pid });
+
       await clearStaleSessionLockIfNeeded();
       if (Date.now() >= deadline) {
+        finishLockWait('failed');
         const meta = await readSessionLockMeta();
         throw new Error(
           'Boss session is busy for more than 30s. Lock owner: ' +
