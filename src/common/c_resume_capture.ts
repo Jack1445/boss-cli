@@ -1,4 +1,7 @@
 import type { ElementHandle, Frame, Page } from 'puppeteer-core';
+import { writeFile } from 'node:fs/promises';
+import { inspectResumePng } from './resume_png_quality.js';
+import { bossDebug, bossTimed } from './debug.js';
 import { sleepRandom } from '../browser/timing.js';
 import { resumeHeight, setTempHeight } from '../browser/viewport_temp.js';
 
@@ -112,42 +115,129 @@ export async function findVisibleCResumeIframeHandle(page: Page): Promise<Elemen
   return null;
 }
 
+// A mounted, tall iframe can still contain only a watermark or an invisible body.
+export const C_RESUME_CONTENT_STATE_SCRIPT = `(() => {
+  const body = document.body;
+  const text = body?.innerText?.trim() || '';
+  const height = Math.max(body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0);
+  const conditions = { visibility: document.visibilityState, readyState: document.readyState, fonts: document.fonts.status };
+  if (!body || document.visibilityState !== 'visible' || !['complete', 'interactive'].includes(document.readyState)) return { ready: false, text, height, visibleChars: 0, ...conditions };
+  const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+  let node, visibleChars = 0;
+  while ((node = walker.nextNode())) {
+    const parent = node.parentElement;
+    if (!node.textContent?.trim() || !parent || !parent.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true, contentVisibilityAuto: true })) continue;
+    const range = document.createRange(); range.selectNodeContents(node);
+    if (range.getBoundingClientRect().width > 0) visibleChars += node.textContent.trim().length;
+  }
+  const canvases = Array.from(document.querySelectorAll('canvas')).filter(el =>
+    el.width > 100 && el.height > 100 && el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true, contentVisibilityAuto: true }) &&
+    el.getBoundingClientRect().width > 100 && el.getBoundingClientRect().height > 100);
+  const textReady = visibleChars >= 80 && /教育经历|工作经历|项目经历|个人优势|期望职位/.test(text);
+  // BOSS also serves online resumes as one canvas with no DOM text. This is a
+  // distinct renderer, accepted only after the caller verifies the target card.
+  const mode = textReady ? 'text' : visibleChars === 0 && canvases.length === 1 ? 'canvas' : 'pending';
+  const canvasRect = mode === 'canvas' ? canvases[0].getBoundingClientRect() : null;
+  const canvas = canvasRect ? { width: canvases[0].width, height: canvases[0].height, cssTop: canvasRect.top, cssHeight: canvasRect.height } : null;
+  const ready = mode !== 'pending' && height > 100 && document.fonts.status === 'loaded';
+  return { ready, mode, canvas, text, height, visibleChars, ...conditions };
+})()`;
+
+/** A minimized Chrome window can return background-only screenshots despite a populated DOM. */
+export async function prepareResumeCaptureWindow(page: Page): Promise<void> {
+  const session = await page.createCDPSession();
+  try {
+    const { windowId, bounds } = await session.send('Browser.getWindowForTarget');
+    bossDebug('resume.window', { state: bounds.windowState });
+    if (bounds.windowState === 'minimized') await session.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
+    await page.bringToFront();
+  } finally { await session.detach(); }
+}
+
+export const C_RESUME_RESET_SCROLL_SCRIPT = `(() => {
+  let changed = 0;
+  for (const node of [document.documentElement, document.body, ...document.querySelectorAll('body *')]) {
+    if (node && (node.scrollTop !== 0 || node.scrollLeft !== 0) && typeof node.scrollTo === 'function') {
+      node.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+      changed++;
+    }
+  }
+  return changed;
+})()`;
+
+/** Reset the resume, its modal, and every containing frame before each capture. */
+async function resetCResumeScrollPosition(content: Frame): Promise<number> {
+  let changed = 0;
+  for (let frame: Frame | null = content; frame; frame = frame.parentFrame()) {
+    // String evaluate expressions must invoke themselves. An `el => ...` string
+    // passed to ElementHandle.evaluate returns a function without running it.
+    changed += await frame.evaluate(C_RESUME_RESET_SCROLL_SCRIPT) as number;
+  }
+  if (changed) bossDebug('resume.scroll-reset', { containers: changed });
+  return changed;
+}
+
+/** ElementHandle.screenshot adds the owning frame's scroll offset to a box that
+ * is already relative to the main frame. Use main-document coordinates once,
+ * without screenshot's implicit scrollIntoView moving the prepared viewport. */
+export async function captureCResumePng(page: Page, iframe: ElementHandle<Element>): Promise<Uint8Array> {
+  const box = await iframe.boundingBox();
+  if (!box || box.width <= 8 || box.height <= 8) throw new Error('在线简历截图区域不可见');
+  const origin = await page.evaluate('(() => ({ x: window.scrollX, y: window.scrollY }))()') as { x: number; y: number };
+  const clip = { x: box.x + origin.x, y: box.y + origin.y, width: box.width, height: box.height };
+  bossDebug('resume.capture-region', clip);
+  return page.screenshot({ type: 'png', captureBeyondViewport: true, clip });
+}
+
 export async function waitForVisibleCResumeIframeReady(
   page: Page,
-  timeoutMs = 6_000,
+  timeoutMs = 15_000,
+  expectedName?: string,
+  verifiedCanvasTarget = false,
+  captureViewport?: NonNullable<Awaited<ReturnType<Page['viewport']>>>,
 ): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
+  let previousSignature = '', stableSince = 0;
+  let lastDiagnostic = '';
   while (Date.now() < deadline) {
     const iframe = await findVisibleCResumeIframeHandle(page);
-    if (!iframe) {
-      await sleepRandom(100, 180);
-      continue;
-    }
+    if (!iframe) { previousSignature = ''; await sleepRandom(100, 180); continue; }
     try {
-      const box = await iframe.boundingBox();
       const contentFrame = await iframe.contentFrame();
-      if (box && box.width > 8 && box.height > 8) {
-        if (!contentFrame) {
-          return true;
+      if (contentFrame && await resetCResumeScrollPosition(contentFrame)) previousSignature = '';
+      const box = await iframe.boundingBox();
+      if (box && box.width > 8 && box.height > 8 && contentFrame) {
+        const state = await contentFrame.evaluate(C_RESUME_CONTENT_STATE_SCRIPT) as { ready: boolean; mode?: string; canvas?: { width: number; height: number; cssTop: number; cssHeight: number } | null; text?: string; height?: number; visibleChars?: number; visibility?: string; readyState?: string; fonts?: string };
+        const captureHeight = Math.ceil(Math.max((state.height || 0) + 200, box.y + box.height + 40));
+        if (captureViewport && state.height && captureHeight > (page.viewport()?.height || 0)) {
+          await setTempHeight(page, captureViewport, captureHeight);
+          previousSignature = '';
+          continue;
         }
-        try {
-          const ready = (await contentFrame.evaluate(`(() => {
-            const body = document.body;
-            const doc = document.documentElement;
-            const readyStateOk = document.readyState === "complete" || document.readyState === "interactive";
-            const contentHeight = Math.max(body?.scrollHeight || 0, doc?.scrollHeight || 0);
-            return readyStateOk && contentHeight > 100;
-          })()`)) as boolean;
-          if (ready) {
+        const targetMatches = state.mode === 'canvas' ? verifiedCanvasTarget : !expectedName || state.text?.includes(expectedName);
+        const diagnostic = JSON.stringify({ ready: state.ready, mode: state.mode, canvas: state.canvas, textChars: state.text?.length, targetMatches, height: state.height, visibleChars: state.visibleChars, visibility: state.visibility, readyState: state.readyState, fonts: state.fonts, width: box.width, frameHeight: box.height });
+        if (diagnostic !== lastDiagnostic) { bossDebug('resume.content-state', JSON.parse(diagnostic)); lastDiagnostic = diagnostic; }
+        if (state.ready && targetMatches) {
+          const signature = JSON.stringify([state.mode, state.canvas, state.text, state.height, box.x, box.y, box.width, box.height]);
+          if (signature !== previousSignature) { previousSignature = signature; stableSince = Date.now(); }
+          else if (Date.now() - stableSince >= 600) {
+            if (state.mode === 'canvas') {
+              if (captureViewport && state.canvas && (Math.abs(state.canvas.cssTop) > 1 || state.canvas.cssHeight < (state.height || 0) - 1)) {
+                await sleepRandom(200, 300);
+                continue;
+              }
+              // Size alone says nothing about whether the canvas has painted.
+              // Wait for real screenshot pixels; never save this probe image.
+              const quality = inspectResumePng(await captureCResumePng(page, iframe));
+              bossDebug('resume.canvas-quality', quality);
+              if (!quality.readable) { await sleepRandom(200, 300); continue; }
+            }
+            bossDebug('resume.content-ready', { height: state.height, visibleChars: state.visibleChars });
             return true;
           }
-        } catch {
-          return true;
-        }
-      }
-    } finally {
-      await iframe.dispose();
-    }
+        } else previousSignature = '';
+      } else previousSignature = '';
+    } finally { await iframe.dispose(); }
     await sleepRandom(100, 180);
   }
   return false;
@@ -161,32 +251,26 @@ export async function captureCResumeIframeToFile(
   page: Page,
   preOpenViewport: Awaited<ReturnType<Page['viewport']>>,
   absPath: string,
+  expectedName?: string,
+  verifiedCanvasTarget = false,
 ): Promise<boolean> {
   try {
+    await prepareResumeCaptureWindow(page);
     await setTempHeight(page, preOpenViewport);
-    await waitForVisibleCResumeIframeReady(page, 2_000);
 
     const iframe = await findVisibleCResumeIframeHandle(page);
     if (!iframe) {
       return false;
     }
 
-    await iframe.evaluate(`((el) => {
-      el.scrollIntoView({ block: "start", inline: "nearest" });
-    })`);
-
-    const box = await iframe.boundingBox();
-    if (!box) {
-      await iframe.dispose();
-      return false;
-    }
-
     try {
-      await iframe.screenshot({
-        path: absPath,
-        type: 'png',
-        captureBeyondViewport: true,
-      });
+      const ready = await bossTimed('resume.content_ready', () => waitForVisibleCResumeIframeReady(page, 15_000, expectedName, verifiedCanvasTarget, preOpenViewport || undefined));
+      if (!ready) throw new Error('在线简历正文未显示或布局未稳定，未保存截图；请保持 BOSS 窗口可见后重新读取');
+      const bytes = await bossTimed('resume.screenshot', () => captureCResumePng(page, iframe));
+      const quality = inspectResumePng(bytes);
+      bossDebug('resume.image-quality', quality);
+      if (!quality.readable) throw new Error(`在线简历截图为空白或仅有水印，未保存（${quality.width}×${quality.height}，正文像素 ${quality.darkPixels}）；请保持 BOSS 窗口可见后重新读取`);
+      await writeFile(absPath, bytes);
     } finally {
       await iframe.dispose();
     }

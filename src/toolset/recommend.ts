@@ -1,4 +1,5 @@
 import type { Frame, Page } from 'puppeteer-core';
+import { TimeoutError } from 'puppeteer-core';
 import { readFile } from 'node:fs/promises';
 import {
   JOB_SEARCH_ACTION_GAP_MS,
@@ -87,7 +88,7 @@ async function ensureRecommendFrameReady(frame: Frame): Promise<void> {
   );
 }
 
-async function readCurrentRecommendJobLabel(frame: Frame): Promise<string> {
+export async function readCurrentRecommendJobLabel(frame: Frame): Promise<string> {
   return (await frame.evaluate(`(() => {
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
     return norm(document.querySelector(".job-selecter-wrap .ui-dropmenu-label")?.textContent);
@@ -202,6 +203,68 @@ export async function selectRecommendJob(frame: Frame, keyword: string): Promise
   return label;
 }
 
+async function openExactJobDropdown(frame: Frame): Promise<void> {
+  await frame.evaluate(`(() => {
+    const host = document.querySelector('.job-selecter-wrap .ui-dropmenu-label');
+    if (!(host instanceof HTMLElement)) throw new Error('未找到推荐岗位下拉入口');
+    host.click();
+  })()`);
+  await waitForRecommendJobDropdownReady(frame);
+  await frame.evaluate(`(() => {
+    const input = document.querySelector('.job-selecter-options .top-chat-search .chat-job-search');
+    if (!(input instanceof HTMLInputElement)) throw new Error('未找到推荐岗位搜索框');
+    input.value = '';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await sleepRandom(JOB_SEARCH_ACTION_GAP_MS.min, JOB_SEARCH_ACTION_GAP_MS.max);
+  await waitForRecommendJobSearchResults(frame, '');
+}
+
+export async function readRecommendJobOptions(frame: Frame): Promise<string[]> {
+  return await frame.evaluate(`(() => {
+    const norm = v => (v ?? '').replace(/\\s+/g, ' ').trim();
+    return Array.from(document.querySelectorAll('.job-selecter-options .job-list .job-item'))
+      .map(el => norm(el.querySelector('.label')?.textContent || el.textContent)).filter(Boolean);
+  })()`) as string[];
+}
+
+export async function selectExactRecommendJob(frame: Frame, label: string): Promise<string> {
+  const expected = label.replace(/\s+/g, ' ').trim();
+  if (!expected) throw new Error('必须提供完整的推荐岗位标签');
+  // Keep loaded candidate cards when already on the requested job; important
+  // for the sequential screenshots immediately after a bounded collection.
+  if (await readCurrentRecommendJobLabel(frame) === expected) return expected;
+  await openExactJobDropdown(frame);
+  await frame.evaluate(`(() => {
+    const expected = ${JSON.stringify(expected)};
+    const norm = v => (v ?? '').replace(/\\s+/g, ' ').trim();
+    const matches = Array.from(document.querySelectorAll('.job-selecter-options .job-list .job-item'))
+      .filter(el => norm(el.querySelector('.label')?.textContent || el.textContent) === expected);
+    if (matches.length !== 1) throw new Error('岗位不存在或完整标签重复，请刷新推荐岗位列表；未读取候选人');
+    matches[0].scrollIntoView({ block: 'nearest' });
+    matches[0].click();
+  })()`);
+  await sleepRandom(JOB_SELECT_ACTION_GAP_MS.min, JOB_SELECT_ACTION_GAP_MS.max);
+  await waitForRecommendJobSelected(frame, expected);
+  return expected;
+}
+
+export async function runRecommendJobs(): Promise<string> {
+  return withBossSessionPage(async page => {
+    const frame = await ensureInRecommendPage(page);
+    const current = await readCurrentRecommendJobLabel(frame);
+    await openExactJobDropdown(frame);
+    try {
+      const jobs = await readRecommendJobOptions(frame);
+      if (!jobs.length || jobs.length > 2000 || new Set(jobs).size !== jobs.length) throw new Error('推荐岗位列表为空、数量异常或标签重复，无法准确区分岗位');
+      return JSON.stringify({ version: 1, current_job: current, jobs, captured_at: new Date().toISOString() });
+    } finally {
+      await frame.evaluate(`(() => document.querySelector('.job-selecter-wrap .ui-dropmenu-label')?.click())()`);
+    }
+  });
+}
+
 export async function ensureInRecommendPage(page: Page): Promise<Frame> {
   await ensurePage(page, {
     name: '推荐列表页',
@@ -233,8 +296,8 @@ export async function assertRecommendPageReadyForPreview(page: Page): Promise<Fr
 }
 
 export async function readRecommendList(frame: Frame, limit?: number, excluded: Array<{ name: string; baseInfo: string }> = []): Promise<RecommendCandidate[]> {
-  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 10)) {
-    throw new Error('推荐试读数量必须是 1 到 10 的整数。');
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 50)) {
+    throw new Error('推荐读取数量必须是 1 到 50 的整数。');
   }
   return (await frame.evaluate(`(() => {
     const norm = (v) => (v ?? "").replace(/\\s+/g, " ").trim();
@@ -551,14 +614,30 @@ export async function collectNewRecommendations(frame: Frame, limit: number, exc
       }
       window.scrollTo(0, document.documentElement.scrollHeight);
     })()`);
-    await sleepRandom(700, 1000);
+    // BOSS appends cards on scroll. Wait for a changed list, rather than
+    // assuming a fixed short sleep is enough on a slow connection.
+    try {
+      await frame.waitForFunction(`((previous) => {
+        const nodes = Array.from(document.querySelectorAll(${JSON.stringify(RECOMMEND_CARD_ROOT_SELECTOR)}));
+        const current = JSON.stringify(nodes.map(el => {
+          const inner = el.querySelector('.card-inner') || el;
+          return [inner.getAttribute('data-geekid') || inner.getAttribute('data-geek') || '', el.querySelector('.name')?.textContent || ''];
+        }));
+        return current !== previous;
+      })`, { timeout: 5000, polling: 200 }, signature);
+    } catch (error) {
+      // A full bounded wait with no new cards counts toward the explicit
+      // three-round end condition. Other browser errors must surface.
+      if (!(error instanceof TimeoutError)) throw error;
+    }
   }
   return { candidates: collected, stop_reason: 'scan_limit' };
 }
 
-export async function runRecommend(jobKeyword?: string, options: { limit?: number; json?: boolean; excludeFile?: string } = {}): Promise<string> {
+export async function runRecommend(jobKeyword?: string, options: { limit?: number; json?: boolean; excludeFile?: string; jobLabel?: string } = {}): Promise<string> {
   const limit = options.limit ?? 10;
-  if (!Number.isInteger(limit) || limit < 1 || limit > 10) throw new Error('推荐试读数量必须是 1 到 10 的整数。');
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new Error('推荐读取数量必须是 1 到 50 的整数。');
+  if (jobKeyword && options.jobLabel) throw new Error('岗位关键字与完整岗位标签不能同时使用');
   let excluded: Array<{ name: string; baseInfo: string }> = [];
   if (options.excludeFile) {
     const input: unknown = JSON.parse(await readFile(options.excludeFile, 'utf8'));
@@ -568,8 +647,9 @@ export async function runRecommend(jobKeyword?: string, options: { limit?: numbe
   try {
     return await withBossSessionPage(async (page) => {
       const frame = await ensureInRecommendPage(page);
-      const selectedJob = await selectRecommendJob(frame, (jobKeyword ?? '').trim());
+      const selectedJob = options.jobLabel ? await selectExactRecommendJob(frame, options.jobLabel) : await selectRecommendJob(frame, (jobKeyword ?? '').trim());
       const { candidates, stop_reason } = options.excludeFile ? await collectNewRecommendations(frame, limit, excluded) : { candidates: await readRecommendList(frame, limit), stop_reason: 'loaded' };
+      if (await readCurrentRecommendJobLabel(frame) !== selectedJob) throw new Error('读取期间推荐岗位发生变化，结果未保存，请重新选择岗位');
       if (options.json) return JSON.stringify({ version: 1, job_label: selectedJob, limit, candidates, stop_reason, captured_at: new Date().toISOString() });
       const title = selectedJob ? `当前岗位：${selectedJob}` : '当前岗位：默认';
       return [title, '', renderRecommendList(candidates)].join('\n');

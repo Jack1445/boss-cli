@@ -1,5 +1,6 @@
 import { withBossSessionPage } from '../common/boss_session_page.js';
 import { ensureChatListReady } from './list.js';
+import { ensureChatTarget } from './chat-history.js';
 
 export type CommunicationEvidence = {
   recruiter_sent: boolean;
@@ -19,38 +20,46 @@ export function classifyEvidence(e: CommunicationEvidence): 'outgoing' | 'incomi
   return 'unknown';
 }
 
-type Target = { id: string; name: string; job: string };
+type Target = { id: string; sourceId: string; name: string; job: string };
 export function validateTargets(value: unknown): asserts value is Target[] {
   if (!Array.isArray(value) || value.length < 1 || value.length > 10 || value.some((t) =>
     !t || typeof t.id !== 'string' || !t.id || typeof t.name !== 'string' || !t.name.trim() ||
-    typeof t.job !== 'string' || !t.job.trim()) || new Set(value.map((t) => t.id)).size !== value.length) {
-    throw new Error('核验目标必须为 1 到 10 个不重复的 {id, name, job} 对象。');
+    typeof t.job !== 'string' || !t.job.trim() || typeof t.sourceId !== 'string' || !t.sourceId.trim()) || new Set(value.map((t) => t.id)).size !== value.length) {
+    throw new Error('核验目标必须为 1 到 10 个不重复的 {id, sourceId, name, job} 对象；缺少 BOSS 会话编号时请先同步。');
   }
+}
+
+export function openChatScript(target: Target): string {
+  const key = JSON.stringify({ sourceId: target.sourceId, name: target.name, job: target.job });
+  return `(() => {
+          const target = ${key};
+          const norm = v => (v ?? '').replace(/\\s+/g, ' ').trim();
+          const rows = Array.from(document.querySelectorAll('.user-list .geek-item')).filter(el => el.getAttribute('data-id') === target.sourceId);
+          if (!rows.length) throw new Error('当前列表未找到目标 BOSS 会话编号，请重新同步');
+          if (rows.some(el => norm(el.querySelector('.geek-name')?.textContent) !== target.name || norm(el.querySelector('.source-job')?.textContent) !== target.job)) throw new Error('会话编号对应的姓名或岗位已变化，请重新同步');
+          const el = rows[0];
+          const previousId = document.querySelector('.geek-item.selected')?.getAttribute('data-id');
+          const previousName = norm(document.querySelector('.base-info-single-container .name-box')?.textContent);
+          const previousChat = previousId !== target.sourceId && previousName === target.name ? document.querySelector('.chat-message-list')?.innerHTML || '' : '';
+          const message = norm(el.querySelector('.push-text')?.textContent);
+          const time = norm(el.querySelector('.time')?.textContent);
+          el.click();
+          return { message, time, previousChat };
+        })()`;
 }
 
 export async function runClassifyCommunications(value: unknown): Promise<string> {
   validateTargets(value);
   return withBossSessionPage(async (page) => {
-    await ensureChatListReady(page);
+    await ensureChatListReady(page, 'all', true);
     const results = [];
     const deadline = Date.now() + 70_000;
     for (const target of value) {
       try {
         if (Date.now() >= deadline) throw new Error('本次核验达到 70 秒上限，请手动重试剩余人员');
-        const key = JSON.stringify({ name: target.name, job: target.job });
-        const row = await page.evaluate(`(() => {
-          const target = ${key};
-          const norm = v => (v ?? '').replace(/\\s+/g, ' ').trim();
-          const rows = Array.from(document.querySelectorAll('.geek-item')).filter(el =>
-            norm(el.querySelector('.geek-name')?.textContent) === target.name &&
-            norm(el.querySelector('.source-job')?.textContent) === target.job);
-          if (rows.length !== 1) throw new Error('当前已加载列表中目标姓名与岗位匹配数为 ' + rows.length + '，无法唯一定位；请先同步或在 BOSS 加载对应会话');
-          const el = rows[0];
-          const message = norm(el.querySelector('.push-text')?.textContent);
-          const time = norm(el.querySelector('.time')?.textContent);
-          el.click();
-          return { message, time };
-        })()`) as { message: string; time: string };
+        await ensureChatTarget(page, target, deadline);
+        const key = JSON.stringify({ sourceId: target.sourceId, name: target.name, job: target.job });
+        const row = await page.evaluate(openChatScript(target)) as { message: string; time: string; previousChat: string };
         // Wait for BOTH the selected row and matching detail panel. Merely
         // waiting for any message list can read the previous person's chat.
         const snapshotScript = `(() => {
@@ -58,7 +67,7 @@ export async function runClassifyCommunications(value: unknown): Promise<string>
           const norm = v => (v ?? '').replace(/\\s+/g, ' ').trim();
           const visible = el => !!el && el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0 && getComputedStyle(el).visibility !== 'hidden';
           const selected = document.querySelector('.geek-item.selected');
-          if (!selected || norm(selected.querySelector('.geek-name')?.textContent) !== target.name || norm(selected.querySelector('.source-job')?.textContent) !== target.job) return null;
+          if (!selected || selected.getAttribute('data-id') !== target.sourceId || norm(selected.querySelector('.geek-name')?.textContent) !== target.name || norm(selected.querySelector('.source-job')?.textContent) !== target.job) return null;
           const detail = Array.from(document.querySelectorAll('.base-info-single-container')).find(visible);
           if (!detail || norm(detail.querySelector('.name-box')?.textContent) !== target.name) return null;
           const position = norm(detail.querySelector('.position-item .position-name')?.textContent);
@@ -66,6 +75,7 @@ export async function runClassifyCommunications(value: unknown): Promise<string>
           const lists = Array.from(document.querySelectorAll('.chat-message-list')).filter(visible);
           if (lists.length !== 1) return null;
           const list = lists[0];
+          if (${JSON.stringify(row.previousChat)} && list.innerHTML === ${JSON.stringify(row.previousChat)}) return null;
           if (!list.querySelector('.message-item')) return null;
           const hasMessage = selector => Array.from(list.querySelectorAll(selector)).some(el => !!norm(el.textContent) || !!el.querySelector('img, .resume-icon'));
           const controls = Array.from(document.querySelectorAll('.operate-icon-item')).filter(visible);
