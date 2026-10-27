@@ -30,6 +30,7 @@ import { runGetChatHistory, runInspectChatScroll, runInspectChatIdentities } fro
 import { validateSince } from '../toolset/chat-history.js';
 import { runRecommendJobs } from '../toolset/recommend.js';
 import { runRecommendResume } from '../toolset/recommend-resume.js';
+import { runRecommendGreetExact } from '../toolset/recommend-greet-exact.js';
 import {
   printPackageUpdateNoticeIfDue,
   printVersionInfo,
@@ -187,6 +188,9 @@ function printHelp(): void {
       对当前列表中的候选人点击“打招呼”
       可选 --job 先在岗位下拉中模糊匹配并切换（与 recommend 共用同一套选择逻辑）
       会消耗打招呼次数且单次成本较高，请谨慎使用
+  boss recommend-greet --geek-id <ID> --name <姓名> --base-info <基本信息> --job-label <完整岗位标签>
+      AI HR 人工确认后调用；进入推荐页并精确选择岗位，核对 ID、姓名、基本信息后只点击此人
+      仅操作当前已加载列表，不翻页、不刷新、不按姓名模糊匹配；输出 JSON 执行结果
   boss deep-search [岗位关键字] [--job <岗位关键字>] [--core <核心要求>] [--bonus <加分项>] [--clear-core] [--clear-bonus] [--match]
       进入「深度搜索」页并输出当前表单、剩余匹配次数和按钮状态；--core/--bonus 可重复，并按传入列表同步对应分组；--clear-* 清空对应分组
       只有显式提供 --match 时才会点击「立即匹配」并消耗今日匹配次数；--match 输出列表顶部最新 20 条
@@ -566,6 +570,12 @@ export async function executeCommand(argv: string[]): Promise<string> {
   if (cmd === 'recommend-jobs') {
     if (tail.length) die('❌ 用法: recommend-jobs');
     return runRecommendJobs();
+  }
+
+  if (cmd === 'recommend-greet') {
+    const { rest, opts, flags } = parseOpts(tail);
+    if (rest.length || flags.size || Object.keys(opts).some(key => !['geek-id', 'name', 'base-info', 'job-label'].includes(key)) || !opts['geek-id'] || !opts.name || !opts['base-info'] || !opts['job-label']) die('❌ 用法: recommend-greet --geek-id <ID> --name <姓名> --base-info <基本信息> --job-label <完整岗位标签>');
+    return runRecommendGreetExact({ geekId: opts['geek-id'], name: opts.name, baseInfo: opts['base-info'], jobLabel: opts['job-label'] });
   }
 
   if (cmd === 'recommend-resume') {
